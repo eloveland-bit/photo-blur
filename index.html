@@ -198,4 +198,483 @@ function scaled(src, w, h, max, mult) {
 async function detectText(m, bmp, w, h) {
   const c = scaled(bmp, w, h, TEXT_MAX, 32), W = c.width, H = c.height;
   const px = c.getContext('2d').getImageData(0, 0, W, H).data, n = W * H;
-  const f = new Float32Array(3 * n), mean = [0.485, 0.456, 0.406], sd =
+  const f = new Float32Array(3 * n), mean = [0.485, 0.456, 0.406], sd = [0.229, 0.224, 0.225];
+  for (let i = 0; i < n; i++) for (let k = 0; k < 3; k++) f[k * n + i] = (px[i * 4 + k] / 255 - mean[k]) / sd[k];
+  const out = await m.text.run({ [m.text.inputNames[0]]: new m.ort.Tensor('float32', f, [1, 3, H, W]) });
+  const p = out[m.text.outputNames[0]].data, lab = new Int32Array(n), stack = new Int32Array(n), boxes = [];
+  let id = 0;
+  for (let i = 0; i < n; i++) {
+    if (lab[i] || p[i] <= 0.3) continue;
+    id++; let sp = 0, cnt = 0, sum = 0, x0 = W, y0 = H, x1 = 0, y1 = 0; stack[sp++] = i; lab[i] = id;
+    while (sp) {
+      const j = stack[--sp], x = j % W, y = (j / W) | 0; cnt++; sum += p[j];
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      const nb = [x > 0 ? j - 1 : -1, x < W - 1 ? j + 1 : -1, y > 0 ? j - W : -1, y < H - 1 ? j + W : -1];
+      for (const q of nb) if (q >= 0 && !lab[q] && p[q] > 0.3) { lab[q] = id; stack[sp++] = q; }
+    }
+    const bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+    if (cnt < 12 || sum / cnt < 0.6 || Math.min(bw, bh) < 3) continue;
+    const d = cnt * 1.6 / (2 * (bw + bh));
+    boxes.push([x0 - d, y0 - d, bw + 2 * d, bh + 2 * d, sum / cnt]);
+  }
+  const sx = w / W, sy = h / H;
+  return boxes.map(([x, y, bw, bh, sc]) => {
+    x *= sx; y *= sy; bw *= sx; bh *= sy; const pad = Math.min(bw, bh) * 0.22;
+    return { kind: 'text', x: x - pad, y: y - pad, w: bw + 2 * pad, h: bh + 2 * pad, score: sc };
+  });
+}
+async function detect(ph) {
+  const m = await loadModels(); if (!m) return;
+  const bmp = await createImageBitmap(ph.file, { imageOrientation: 'from-image' });
+  const regs = [];
+  try {
+    const dc = scaled(bmp, ph.w, ph.h, DET_MAX);
+    const r = await m.human.detect(dc);
+    for (const o of r.object || []) if (VEH.has(o.label)) {
+      const [x, y, w, h] = o.boxRaw; const pad = 0.03;
+      regs.push({ kind: 'vehicle', x: (x - pad * w) * ph.w, y: (y - pad * h) * ph.h, w: w * (1 + 2 * pad) * ph.w, h: h * (1 + 2 * pad) * ph.h, score: o.score });
+    }
+    for (const f of r.face || []) {
+      const [x, y, w, h] = f.boxRaw; const pad = 0.18;
+      regs.push({ kind: 'face', x: (x - pad * w) * ph.w, y: (y - pad * 1.3 * h) * ph.h, w: w * (1 + 2 * pad) * ph.w, h: h * (1 + 2.6 * pad) * ph.h, score: f.score });
+    }
+    regs.push(...await detectText(m, bmp, ph.w, ph.h));
+  } finally { bmp.close(); }
+  ph.regions = regs.map(r => clampR({ ...r, id: uid++ }, ph)).filter(r => r.w > 4 && r.h > 4);
+  ph.detected = JSON.stringify(ph.regions);
+}
+const clampR = (r, ph) => { const x = Math.max(0, r.x), y = Math.max(0, r.y); r.w = Math.min(ph.w, r.x + r.w) - x; r.h = Math.min(ph.h, r.y + r.h) - y; r.x = x; r.y = y; return r; };
+
+/* ---------- blur engine ---------- */
+// Every blur, brush stroke and eraser stroke is an "op". They are applied in order,
+// so an eraser stroke removes blur from anything under it that came before it.
+const isStroke = o => o.kind === 'brush' || o.kind === 'erase';
+const active = o => !AUTO.has(o.kind) || set[o.kind] !== false;
+function gaussBoxes(sigma) {
+  const n = 3, wIdeal = Math.sqrt(12 * sigma * sigma / n + 1); let wl = Math.floor(wIdeal); if (wl % 2 === 0) wl--;
+  const m = Math.round((12 * sigma * sigma - n * wl * wl - 4 * n * wl - 3 * n) / (-4 * wl - 4));
+  return [0, 1, 2].map(i => ((i < m ? wl : wl + 2) - 1) / 2);
+}
+function boxPass(s, t, w, h, r, horiz, nc) {
+  const len = horiz ? w : h, lines = horiz ? h : w, iarr = 1 / (r + r + 1), chs = nc === 1 ? 1 : 3;
+  for (let L = 0; L < lines; L++) for (let ch = 0; ch < chs; ch++) {
+    const at = k => (horiz ? (L * w + k) : (k * w + L)) * nc + ch;
+    let acc = (r + 1) * s[at(0)];
+    for (let k = 0; k < r; k++) acc += s[at(Math.min(k, len - 1))];
+    for (let k = 0; k < len; k++) {
+      acc += s[at(Math.min(k + r, len - 1))] - s[at(Math.max(k - r - 1, 0))];
+      t[at(k)] = acc * iarr;
+    }
+  }
+}
+function gaussBlur(data, w, h, sigma, nc = 4) {
+  let a = Float32Array.from(data), b = new Float32Array(a.length);
+  if (nc === 4) b.set(a);
+  for (const r of gaussBoxes(sigma)) { if (r < 1) continue; boxPass(a, b, w, h, r, true, nc); boxPass(b, a, w, h, r, false, nc); }
+  return a;
+}
+function sigmaFor(o, ph) {
+  const im = Math.min(ph.w, ph.h);
+  let s;
+  if (o.kind === 'brush') s = Math.max(o.r * 0.45, im * 0.006);
+  else { const m = Math.min(o.w, o.h);
+    s = o.kind === 'text' ? m * 0.2 : o.kind === 'vehicle' ? m * 0.032 : o.kind === 'face' ? m * 0.09 : Math.min(m * 0.09, im * 0.02); }
+  return Math.max(1.2, s * set.strength);
+}
+function noiseLevel(d, w, h) {
+  const v = []; for (let y = 1; y < h - 1; y += 2) for (let x = 1; x < w - 1; x += 2) {
+    const i = (y * w + x) * 4, l = q => d[q] * 0.3 + d[q + 1] * 0.59 + d[q + 2] * 0.11;
+    v.push(Math.abs(l(i) - (l(i - 4) + l(i + 4) + l(i - w * 4) + l(i + w * 4)) / 4));
+  }
+  if (!v.length) return 1; v.sort((a, b) => a - b); return Math.min(9, Math.max(0.6, v[v.length >> 1] * 1.2));
+}
+function bounds(o) {
+  if (!isStroke(o)) return [o.x, o.y, o.w, o.h];
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const [x, y] of o.pts) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+  return [x0 - o.r, y0 - o.r, x1 - x0 + 2 * o.r, y1 - y0 + 2 * o.r];
+}
+function rectMask(o, s, x0, y0, w, h, f) {
+  const rx = o.x * s, ry = o.y * s, rw = o.w * s, rh = o.h * s, a = new Float32Array(w * h);
+  const rad = o.kind === 'face' ? Math.min(rw, rh) / 2 : Math.min(rw, rh) * 0.28;
+  const cx = rx + rw / 2 - x0, cy = ry + rh / 2 - y0, hx = rw / 2 - rad, hy = rh / 2 - rad;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const qx = Math.max(Math.abs(x + 0.5 - cx) - hx, 0), qy = Math.max(Math.abs(y + 0.5 - cy) - hy, 0);
+    const d = Math.hypot(qx, qy) - rad; if (d >= f) continue;
+    const t = d <= 0 ? 1 : 1 - d / f; a[y * w + x] = t * t * (3 - 2 * t);
+  }
+  return a;
+}
+function strokeMask(o, s, x0, y0, w, h, f) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d', { willReadFrequently: true }), lw = 2 * o.r * s + f * 0.6;
+  g.fillStyle = g.strokeStyle = '#fff'; g.lineCap = g.lineJoin = 'round'; g.lineWidth = lw;
+  const P = o.pts.map(([x, y]) => [x * s - x0, y * s - y0]);
+  g.beginPath();
+  if (P.length === 1) { g.arc(P[0][0], P[0][1], lw / 2, 0, Math.PI * 2); g.fill(); }
+  else { P.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); g.stroke(); }
+  const d = g.getImageData(0, 0, w, h).data, a = new Float32Array(w * h);
+  for (let i = 0; i < a.length; i++) a[i] = d[i * 4 + 3] / 255;
+  const b = gaussBlur(a, w, h, Math.max(1, f / 2), 1);
+  for (let i = 0; i < b.length; i++) { const t = Math.min(1, b[i] * 1.15); b[i] = t * t * (3 - 2 * t); }
+  return b;
+}
+function applyOp(ctx, src, o, ph, s, W, H) {
+  const erase = o.kind === 'erase', sig = erase ? 0 : sigmaFor(o, ph) * s;
+  const f = erase ? Math.max(2, o.r * s * 0.35) : Math.max(2, sig * 1.3);
+  const [bx, by, bw, bh] = bounds(o), m = Math.ceil(f + sig * 3 + 2);
+  const x0 = Math.max(0, Math.floor(bx * s - m)), y0 = Math.max(0, Math.floor(by * s - m));
+  const x1 = Math.min(W, Math.ceil((bx + bw) * s + m)), y1 = Math.min(H, Math.ceil((by + bh) * s + m)), w = x1 - x0, h = y1 - y0;
+  if (w < 2 || h < 2) return;
+  const a = isStroke(o) ? strokeMask(o, s, x0, y0, w, h, f) : rectMask(o, s, x0, y0, w, h, f);
+  const img = ctx.getImageData(x0, y0, w, h), d = img.data;
+  if (erase) {
+    const od = src.getImageData(x0, y0, w, h).data;
+    for (let p = 0; p < a.length; p++) { const t = a[p]; if (t < 0.002) continue; const i = p * 4;
+      for (let c = 0; c < 3; c++) d[i + c] = d[i + c] * (1 - t) + od[i + c] * t; }
+  } else {
+    const bl = gaussBlur(d, w, h, sig), k = noiseLevel(d, w, h) * 0.9;
+    for (let p = 0; p < a.length; p++) { const t = a[p]; if (t < 0.002) continue; const i = p * 4;
+      const n = (Math.random() + Math.random() + Math.random() - 1.5) * 2 * k * t;
+      for (let c = 0; c < 3; c++) d[i + c] = d[i + c] * (1 - t) + bl[i + c] * t + n; }
+  }
+  ctx.putImageData(img, x0, y0);
+}
+function renderTo(ctx, src, ph, s, W, H) { for (const o of ph.regions) if (active(o)) applyOp(ctx, src, o, ph, s, W, H); }
+const brushR = ph => Math.min(ph.w, ph.h) * (0.004 + set.size / 100 * 0.07);
+
+/* ---------- photos ---------- */
+async function addFiles(list) {
+  const files = [...list].filter(f => /^image\/(jpeg|png|webp)$/.test(f.type));
+  if (!files.length) { msg('Those files are not JPG, PNG or WebP.'); return; }
+  for (const file of files) {
+    try {
+      const bmp = await createImageBitmap(file, { imageOrientation: 'from-image' });
+      const ph = { id: uid++, file, name: file.name, w: bmp.width, h: bmp.height, regions: [], undo: [], redo: [], status: 'queued' };
+      ph.src = scaled(bmp, bmp.width, bmp.height, PREVIEW_MAX); ph.scale = ph.src.width / ph.w;
+      ph.thumb = scaled(bmp, bmp.width, bmp.height, 240).toDataURL('image/jpeg', 0.7); bmp.close();
+      photos.push(ph); if (cur < 0) cur = 0;
+    } catch (e) { msg('Could not open ' + file.name); }
+  }
+  drawAll(); runQueue();
+}
+let running = false;
+async function runQueue() {
+  if (running) return; running = true;
+  try {
+    for (const ph of photos) {
+      if (ph.status !== 'queued') continue;
+      ph.status = 'detecting'; strip();
+      busy('Finding areas in ' + ph.name + '…');
+      try { await detect(ph); ph.status = 'ready'; if (photos[cur] === ph) setTool(tool); } catch (e) { ph.status = 'error'; msg('Detection failed on ' + ph.name + ': ' + e.message); }
+      busy(''); if (photos[cur] === ph) drawAll(); else strip();
+    }
+  } finally { running = false; busy(''); }
+}
+
+/* ---------- drawing ---------- */
+const cv = $('cv'), ov = $('ov'), rm = $('rm');
+let hover = null, drag = null, cursorAt = null;
+const HINT = {
+  select: 'Click a blur to select it. Drag to move it, drag a corner to resize, or press Delete to remove it.',
+  brush: 'Paint over anything you want blurred. Adjust the size with the slider or the [ and ] keys.',
+  erase: 'Paint over blur you don’t want, including blur that was added automatically.',
+  box: 'Drag a box around what you want blurred.'
+};
+function drawPhoto() {
+  const ph = photos[cur]; $('drop').hidden = !!ph; $('frame').hidden = !ph; if (!ph) return;
+  cv.width = ov.width = ph.src.width; cv.height = ov.height = ph.src.height;
+  const ctx = cv.getContext('2d', { willReadFrequently: true }); ctx.drawImage(ph.src, 0, 0);
+  if (!showOrig) renderTo(ctx, ph.src.getContext('2d', { willReadFrequently: true }), ph, ph.scale, cv.width, cv.height);
+  drawOverlay();
+}
+function pathOf(o, s, g) {
+  g.beginPath(); o.pts.forEach(([x, y], i) => i ? g.lineTo(x * s, y * s) : g.moveTo(x * s, y * s));
+  if (o.pts.length === 1) g.lineTo(o.pts[0][0] * s + 0.1, o.pts[0][1] * s);
+}
+function drawOverlay() {
+  const ph = photos[cur], g = ov.getContext('2d'); g.clearRect(0, 0, ov.width, ov.height); rm.hidden = true;
+  if (!ph || showOrig) return;
+  const k = ov.width / (ov.clientWidth || ov.width), s = ph.scale;
+  g.font = `500 ${12 * k}px Inter, system-ui, sans-serif`; g.lineCap = g.lineJoin = 'round';
+  for (const o of ph.regions) {
+    if (!active(o)) continue;
+    const hot = o === hover || o === sel;
+    if (isStroke(o)) {
+      if (!hot) continue;
+      g.globalAlpha = 0.35; g.strokeStyle = o.kind === 'erase' ? '#fff' : '#00d47c'; g.lineWidth = 2 * o.r * s;
+      pathOf(o, s, g); g.stroke(); g.globalAlpha = 1; continue;
+    }
+    if (!outlines && !hot) continue;
+    g.setLineDash([]); g.lineWidth = (hot ? 2.5 : 1.5) * k; g.strokeStyle = hot ? '#00d47c' : 'rgba(0,212,124,.8)';
+    g.strokeRect(o.x * s, o.y * s, o.w * s, o.h * s);
+    if (hot) {
+      const label = KIND[o.kind], tw = g.measureText(label).width + 10 * k, th = 18 * k, y = o.y * s;
+      const ly = y - th - 2 * k > 0 ? y - th - 2 * k : y + 2 * k;
+      g.fillStyle = '#00a862'; g.fillRect(o.x * s, ly, tw, th); g.fillStyle = '#fff'; g.fillText(label, o.x * s + 5 * k, ly + 13 * k);
+    }
+  }
+  if (sel && !isStroke(sel)) {
+    g.fillStyle = '#fff'; g.strokeStyle = '#00a862'; g.lineWidth = 2 * k;
+    for (const [hx, hy] of corners(sel)) { const z = 10 * k; g.fillRect(hx * s - z / 2, hy * s - z / 2, z, z); g.strokeRect(hx * s - z / 2, hy * s - z / 2, z, z); }
+  }
+  if (sel) {
+    const [bx, by, bw, bh] = bounds(sel), top = by / ph.h < 0.08;
+    rm.hidden = false; rm.style.left = Math.min(100, (bx + bw) / ph.w * 100) + '%';
+    rm.style.top = (top ? Math.min(100, (by + bh) / ph.h * 100) : by / ph.h * 100) + '%';
+    rm.style.transform = top ? 'translate(-100%, 10px)' : 'translate(-100%, -115%)';
+    rm.textContent = sel.kind === 'erase' ? 'Remove eraser' : 'Remove blur';
+  }
+  if (drag && drag.mode === 'box' && drag.r) {
+    g.setLineDash([6 * k, 5 * k]); g.lineWidth = 2 * k; g.strokeStyle = '#fff';
+    g.strokeRect(drag.r.x * s, drag.r.y * s, drag.r.w * s, drag.r.h * s); g.setLineDash([]);
+  }
+  if (drag && drag.mode === 'paint') {
+    g.globalAlpha = 0.4; g.strokeStyle = drag.op.kind === 'erase' ? '#fff' : '#00d47c'; g.lineWidth = 2 * drag.op.r * s;
+    pathOf(drag.op, s, g); g.stroke(); g.globalAlpha = 1;
+  }
+  if ((tool === 'brush' || tool === 'erase') && cursorAt) {
+    g.beginPath(); g.arc(cursorAt[0] * s, cursorAt[1] * s, brushR(ph) * s, 0, Math.PI * 2);
+    g.lineWidth = 3 * k; g.strokeStyle = 'rgba(0,0,0,.6)'; g.stroke();
+    g.lineWidth = 1.5 * k; g.strokeStyle = tool === 'erase' ? '#fff' : '#00d47c'; g.stroke();
+  }
+}
+function strip() {
+  $('strip').innerHTML = photos.map((p, i) => {
+    const n = p.regions.filter(o => active(o) && o.kind !== 'erase').length;
+    const st = p.status === 'ready' ? n + (n === 1 ? ' blur' : ' blurs') : p.status === 'error' ? 'Error' : 'Finding…';
+    return `<button data-i="${i}" aria-current="${i === cur}"><img src="${p.thumb}" alt=""><span>${esc(p.name)}</span><span>${st}</span></button>`;
+  }).join('');
+}
+const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function panel() {
+  const ph = photos[cur], ready = ph && ph.status === 'ready';
+  const regs = ph ? ph.regions.filter(active) : [];
+  $('areas').innerHTML = regs.map(o => `<li data-id="${o.id}" aria-selected="${o === sel}"><span class="k">${o.kind === 'erase' ? 'Eraser <small>unblurs</small>' : KIND[o.kind]}${o.score ? ` <small>${Math.round(o.score * 100)}%</small>` : ''}</span><button data-del>Remove</button></li>`).join('');
+  $('noareas').hidden = regs.length > 0;
+  $('noareas').textContent = !ph ? 'Add a photo to see what was found.' : ph.status !== 'ready' ? 'Still looking…' : 'Nothing found. Use Brush or Box to add blur.';
+  $('areasTitle').textContent = ph ? `Blur in this photo (${cur + 1} of ${photos.length})` : 'Blur in this photo';
+  $('reset').hidden = !ready || ph.detected === JSON.stringify(ph.regions);
+  $('undo').disabled = !ph || !ph.undo.length; $('redo').disabled = !ph || !ph.redo.length; $('hold').disabled = !ph;
+  $('save1').disabled = !ready; $('saveAll').disabled = !photos.some(p => p.status === 'ready');
+}
+function drawAll() { drawPhoto(); strip(); panel(); }
+
+/* ---------- editing ---------- */
+const snap = ph => { ph.undo.push(JSON.stringify(ph.regions)); if (ph.undo.length > 80) ph.undo.shift(); ph.redo = []; };
+function restore(ph, from, to) {
+  if (!from.length) return; to.push(JSON.stringify(ph.regions)); ph.regions = JSON.parse(from.pop());
+  sel = sel && ph.regions.find(o => o.id === sel.id) || null; hover = null; drawAll();
+}
+const undo = () => { const ph = photos[cur]; if (ph) restore(ph, ph.undo, ph.redo); };
+const redo = () => { const ph = photos[cur]; if (ph) restore(ph, ph.redo, ph.undo); };
+function removeSel() {
+  const ph = photos[cur]; if (!ph || !sel) return;
+  snap(ph); ph.regions = ph.regions.filter(o => o !== sel); sel = null; hover = null; drawAll();
+}
+const corners = o => [[o.x, o.y], [o.x + o.w, o.y], [o.x, o.y + o.h], [o.x + o.w, o.y + o.h]];
+const segDist = (px, py, [ax, ay], [bx, by]) => {
+  const dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy, t = L ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / L)) : 0;
+  return Math.hypot(px - ax - t * dx, py - ay - t * dy);
+};
+function hitTest(ph, x, y) {
+  const hits = ph.regions.filter(o => active(o) && (isStroke(o)
+    ? o.pts.some((p, i) => segDist(x, y, p, o.pts[i + 1] || p) <= o.r)
+    : x >= o.x && x <= o.x + o.w && y >= o.y && y <= o.y + o.h));
+  return hits.sort((a, b) => { const A = bounds(a), B = bounds(b); return A[2] * A[3] - B[2] * B[3]; })[0] || null;
+}
+const toImg = e => { const ph = photos[cur], b = ov.getBoundingClientRect(); return [(e.clientX - b.left) / b.width * ph.w, (e.clientY - b.top) / b.height * ph.h]; };
+const pxToImg = () => photos[cur].w / (ov.getBoundingClientRect().width || 1);
+function setTool(t) {
+  tool = t; [...$('toolSeg').children].forEach(b => b.setAttribute('aria-pressed', b.dataset.t === t));
+  $('sizeWrap').hidden = !(t === 'brush' || t === 'erase'); $('hint').textContent = HINT[t];
+  ov.style.cursor = t === 'box' ? 'crosshair' : t === 'select' ? 'default' : 'none';
+  if (t !== 'select') sel = null; drawOverlay(); panel();
+}
+ov.addEventListener('pointerdown', e => {
+  const ph = photos[cur]; if (!ph || ph.status !== 'ready' || showOrig) return;
+  ov.setPointerCapture(e.pointerId); const p = toImg(e), u = pxToImg(), before = JSON.stringify(ph.regions);
+  if (tool === 'select') {
+    const hi = sel && !isStroke(sel) ? corners(sel).findIndex(([hx, hy]) => Math.hypot(hx - p[0], hy - p[1]) < 14 * u) : -1;
+    if (hi >= 0) { drag = { mode: 'resize', hi, p, o: { ...sel }, before }; return; }
+    sel = hitTest(ph, ...p);
+    drag = sel ? { mode: 'move', p, o: JSON.parse(JSON.stringify(sel)), before } : null;
+    drawOverlay(); panel();
+  } else if (tool === 'box') drag = { mode: 'box', p, before };
+  else drag = { mode: 'paint', op: { kind: tool, pts: [p], r: brushR(ph) }, before };
+});
+ov.addEventListener('pointermove', e => {
+  const ph = photos[cur]; if (!ph) return; const p = toImg(e), u = pxToImg();
+  cursorAt = p;
+  if (!drag) {
+    if (tool === 'select') {
+      const h = hitTest(ph, ...p), onHandle = sel && !isStroke(sel) && corners(sel).some(([hx, hy]) => Math.hypot(hx - p[0], hy - p[1]) < 14 * u);
+      ov.style.cursor = onHandle ? 'nwse-resize' : h ? 'move' : 'default';
+      if (h !== hover) hover = h;
+    }
+    drawOverlay(); return;
+  }
+  const dx = p[0] - drag.p?.[0], dy = p[1] - drag.p?.[1];
+  if (drag.mode === 'move') {
+    if (Math.hypot(dx, dy) > 3 * u) drag.moved = true; if (!drag.moved) return;
+    if (isStroke(sel)) sel.pts = drag.o.pts.map(([x, y]) => [x + dx, y + dy]);
+    else { sel.x = drag.o.x + dx; sel.y = drag.o.y + dy; }
+  } else if (drag.mode === 'resize') {
+    drag.moved = true; const o = drag.o, L = drag.hi % 2 === 0, T = drag.hi < 2;
+    const x0 = L ? o.x + dx : o.x, x1 = L ? o.x + o.w : o.x + o.w + dx, y0 = T ? o.y + dy : o.y, y1 = T ? o.y + o.h : o.y + o.h + dy;
+    Object.assign(sel, { x: Math.min(x0, x1), y: Math.min(y0, y1), w: Math.abs(x1 - x0), h: Math.abs(y1 - y0) });
+  } else if (drag.mode === 'box') {
+    drag.r = { x: Math.min(drag.p[0], p[0]), y: Math.min(drag.p[1], p[1]), w: Math.abs(dx), h: Math.abs(dy) };
+  } else if (drag.mode === 'paint') {
+    const pts = drag.op.pts, last = pts[pts.length - 1];
+    if (Math.hypot(p[0] - last[0], p[1] - last[1]) > drag.op.r * 0.2) pts.push(p);
+  }
+  drawOverlay();
+});
+function endDrag() {
+  const ph = photos[cur], d = drag; drag = null; if (!ph || !d) return;
+  const u = pxToImg();
+  if (d.mode === 'move' || d.mode === 'resize') {
+    if (!d.moved) return;
+    if (!isStroke(sel)) clampR(sel, ph);
+    if (sel.w < 4 || sel.h < 4) Object.assign(sel, d.o);
+  } else if (d.mode === 'box') {
+    if (!d.r || d.r.w < 8 * u || d.r.h < 8 * u) { drawOverlay(); return; }
+    const o = clampR({ kind: 'box', id: uid++, ...d.r }, ph); ph.regions.push(o);
+  } else if (d.mode === 'paint') { d.op.id = uid++; ph.regions.push(d.op); }
+  ph.undo.push(d.before); if (ph.undo.length > 80) ph.undo.shift(); ph.redo = [];
+  drawAll();
+}
+ov.addEventListener('pointerup', endDrag);
+ov.addEventListener('pointercancel', endDrag);
+ov.addEventListener('pointerleave', () => { cursorAt = null; if (!drag) { hover = null; drawOverlay(); } });
+rm.addEventListener('pointerdown', e => e.stopPropagation());
+rm.onclick = removeSel;
+$('areas').addEventListener('click', e => {
+  const li = e.target.closest('li'), ph = photos[cur]; if (!li || !ph) return;
+  const o = ph.regions.find(q => q.id === +li.dataset.id); if (!o) return;
+  if (e.target.matches('[data-del]')) { sel = o; removeSel(); return; }
+  if (tool !== 'select') setTool('select'); sel = o; drawOverlay(); panel();
+});
+$('areas').addEventListener('mouseover', e => { const li = e.target.closest('li'), ph = photos[cur]; hover = li && ph ? ph.regions.find(q => q.id === +li.dataset.id) : null; drawOverlay(); });
+$('areas').addEventListener('mouseleave', () => { hover = null; drawOverlay(); });
+$('reset').onclick = () => { const ph = photos[cur]; if (!ph) return; snap(ph); ph.regions = JSON.parse(ph.detected); sel = null; drawAll(); };
+$('strip').addEventListener('click', e => { const b = e.target.closest('button'); if (b) { cur = +b.dataset.i; hover = sel = null; drawAll(); } });
+$('toolSeg').addEventListener('click', e => { const b = e.target.closest('button'); if (b) setTool(b.dataset.t); });
+$('size').value = set.size;
+$('size').oninput = () => { set.size = +$('size').value; saveSet(); drawOverlay(); };
+$('undo').onclick = undo; $('redo').onclick = redo;
+$('outl').onclick = () => { outlines = !outlines; $('outl').setAttribute('aria-pressed', outlines); $('outl').textContent = outlines ? 'Outlines on' : 'Outlines off'; drawOverlay(); };
+const orig = v => { if (showOrig !== v && photos[cur]) { showOrig = v; drawPhoto(); } };
+$('hold').addEventListener('pointerdown', () => orig(true));
+['pointerup', 'pointerleave', 'pointercancel'].forEach(t => $('hold').addEventListener(t, () => orig(false)));
+document.addEventListener('keydown', e => {
+  if (e.target.matches('input:not([type=range])')) return;
+  const mod = e.metaKey || e.ctrlKey, key = e.key.toLowerCase();
+  if (mod && key === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); }
+  else if (mod && key === 'y') { e.preventDefault(); redo(); }
+  else if (mod) return;
+  else if ((e.key === 'Delete' || e.key === 'Backspace') && sel) { e.preventDefault(); removeSel(); }
+  else if (e.key === 'Escape') { sel = null; drawOverlay(); panel(); }
+  else if (key === 'v') setTool('select'); else if (key === 'b') setTool('brush');
+  else if (key === 'e') setTool('erase'); else if (key === 'r') setTool('box');
+  else if (key === 'o') $('outl').click();
+  else if (e.key === '[' || e.key === ']') { set.size = Math.max(1, Math.min(100, set.size + (e.key === ']' ? 5 : -5))); $('size').value = set.size; saveSet(); drawOverlay(); }
+  else if (e.key === ' ' && photos[cur]) { e.preventDefault(); orig(true); }
+  else if (e.key === 'ArrowRight' && cur < photos.length - 1) { cur++; sel = hover = null; drawAll(); }
+  else if (e.key === 'ArrowLeft' && cur > 0) { cur--; sel = hover = null; drawAll(); }
+});
+document.addEventListener('keyup', e => { if (e.key === ' ') orig(false); });
+for (const k of ['text', 'vehicle', 'face', 'meta']) {
+  const el = $('c-' + k); el.checked = set[k];
+  el.onchange = () => { set[k] = el.checked; saveSet(); if (sel && !active(sel)) sel = null; drawAll(); };
+}
+const segs = [...$('strength').children];
+const paintSeg = () => segs.forEach(b => b.setAttribute('aria-pressed', +b.dataset.v === set.strength));
+paintSeg(); segs.forEach(b => b.onclick = () => { set.strength = +b.dataset.v; saveSet(); paintSeg(); drawPhoto(); });
+$('pick').onchange = e => { addFiles(e.target.files); e.target.value = ''; };
+const stage = $('stage');
+stage.addEventListener('dragover', e => { e.preventDefault(); stage.classList.add('over'); });
+stage.addEventListener('dragleave', () => stage.classList.remove('over'));
+stage.addEventListener('drop', e => { e.preventDefault(); stage.classList.remove('over'); addFiles(e.dataTransfer.files); });
+new ResizeObserver(drawOverlay).observe(ov);
+
+/* ---------- export ---------- */
+function exifOf(buf) {
+  const v = new DataView(buf); if (v.getUint16(0) !== 0xFFD8) return null; let p = 2;
+  while (p + 4 < v.byteLength) {
+    const mk = v.getUint16(p), len = v.getUint16(p + 2);
+    if (mk === 0xFFE1 && v.getUint32(p + 4) === 0x45786966) {
+      const seg = new Uint8Array(buf.slice(p, p + 2 + len)), t = 10, dv = new DataView(seg.buffer), le = dv.getUint16(t) === 0x4949;
+      const ifd = t + dv.getUint32(t + 4, le), n = dv.getUint16(ifd, le);
+      for (let i = 0; i < n; i++) { const e = ifd + 2 + i * 12; if (dv.getUint16(e, le) === 0x0112) dv.setUint16(e + 8, 1, le); }
+      return seg;
+    }
+    if (mk === 0xFFDA) break; p += 2 + len;
+  }
+  return null;
+}
+async function renderFull(ph) {
+  const bmp = await createImageBitmap(ph.file, { imageOrientation: 'from-image' });
+  const c = document.createElement('canvas'); c.width = ph.w; c.height = ph.h;
+  const ctx = c.getContext('2d', { willReadFrequently: true }); ctx.drawImage(bmp, 0, 0); bmp.close();
+  let src = ctx;
+  if (ph.regions.some(o => o.kind === 'erase' && active(o))) { const o = document.createElement('canvas'); o.width = ph.w; o.height = ph.h; src = o.getContext('2d', { willReadFrequently: true }); src.drawImage(c, 0, 0); }
+  renderTo(ctx, src, ph, 1, ph.w, ph.h);
+  const png = ph.file.type === 'image/png', type = png ? 'image/png' : 'image/jpeg';
+  let blob = await new Promise(r => c.toBlob(r, type, 0.93));
+  let name = ph.name.replace(/\.(jpe?g|png|webp)$/i, '') + (png ? '.png' : '.jpg');
+  if (set.meta && !png && ph.file.type === 'image/jpeg') {
+    const ex = exifOf(await ph.file.arrayBuffer());
+    if (ex) { const b = new Uint8Array(await blob.arrayBuffer()); let p = 2; if (b[2] === 0xFF && b[3] === 0xE0) p = 4 + ((b[4] << 8) | b[5]); blob = new Blob([b.slice(0, p), ex, b.slice(p)], { type }); }
+  }
+  return { name, blob };
+}
+async function saveBlob(name, blob) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 4000); msg('Saved ' + name);
+}
+const crcT = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+const crc = b => { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = crcT[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+function zip(files) {
+  const parts = [], cen = []; let off = 0; const d = new Date();
+  const time = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1), date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  for (const f of files) {
+    const nm = new TextEncoder().encode(f.name), c = crc(f.data), h = new DataView(new ArrayBuffer(30));
+    [[0, 0x04034b50, 4], [4, 20, 2], [6, 0x0800, 2], [8, 0, 2], [10, time, 2], [12, date, 2], [14, c, 4], [18, f.data.length, 4], [22, f.data.length, 4], [26, nm.length, 2], [28, 0, 2]]
+      .forEach(([o, v, s]) => s === 4 ? h.setUint32(o, v, true) : h.setUint16(o, v, true));
+    parts.push(h.buffer, nm, f.data);
+    const ch = new DataView(new ArrayBuffer(46));
+    [[0, 0x02014b50, 4], [4, 20, 2], [6, 20, 2], [8, 0x0800, 2], [10, 0, 2], [12, time, 2], [14, date, 2], [16, c, 4], [20, f.data.length, 4], [24, f.data.length, 4], [28, nm.length, 2], [42, off, 4]]
+      .forEach(([o, v, s]) => s === 4 ? ch.setUint32(o, v, true) : ch.setUint16(o, v, true));
+    cen.push(ch.buffer, nm); off += 30 + nm.length + f.data.length;
+  }
+  const size = cen.reduce((s, b) => s + b.byteLength, 0), e = new DataView(new ArrayBuffer(22));
+  [[0, 0x06054b50, 4], [8, files.length, 2], [10, files.length, 2], [12, size, 4], [16, off, 4]].forEach(([o, v, s]) => s === 4 ? e.setUint32(o, v, true) : e.setUint16(o, v, true));
+  return new Blob([...parts, ...cen, e.buffer], { type: 'application/zip' });
+}
+$('save1').onclick = async () => {
+  const ph = photos[cur]; $('save1').disabled = true; msg('Preparing full-size photo…');
+  try { const { name, blob } = await renderFull(ph); await saveBlob(name, blob); } catch (e) { msg('Could not save: ' + e.message); }
+  panel();
+};
+$('saveAll').onclick = async () => {
+  const ready = photos.filter(p => p.status === 'ready'); $('saveAll').disabled = true; const files = [], used = new Set();
+  try {
+    for (let i = 0; i < ready.length; i++) {
+      msg(`Preparing ${i + 1} of ${ready.length}…`);
+      let { name, blob } = await renderFull(ready[i]); let n = name, k = 2;
+      while (used.has(n.toLowerCase())) n = name.replace(/(\.\w+)$/, ` (${k++})$1`); used.add(n.toLowerCase());
+      files.push({ name: n, data: new Uint8Array(await blob.arrayBuffer()) });
+    }
+    await saveBlob(`blurred-photos-${new Date().toISOString().slice(0, 10)}.zip`, zip(files));
+  } catch (e) { msg('Could not save: ' + e.message); }
+  panel();
+};
+
+setTool('select');
+drawAll();
+}
+</script>
+</body>
+</html>
