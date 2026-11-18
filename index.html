@@ -78,9 +78,21 @@ button:disabled{opacity:.4;cursor:default}
 #msg{min-height:18px;font-size:13px;color:var(--mute);margin:0}
 @media(max-width:900px){.work{grid-template-columns:minmax(0,1fr)}.stage{min-height:300px}.tools .push{margin-inline-start:0}}
 @media(max-width:600px){.tools kbd{display:none}.bar p{flex-basis:100%;order:3}}
+
+  /* Marketing tools tabs: identical on the Weekly Picker, Photo Map and Photo Blur */
+  .mt-nav{background:#17301f;color:#fff;font-family:'Source Sans 3',system-ui,sans-serif;flex-shrink:0;position:relative;z-index:1500}
+  .mt-nav-in{max-width:1080px;margin:0 auto;padding:0 24px;display:flex;align-items:center;gap:6px 22px;min-height:46px;overflow-x:auto;scrollbar-width:none}
+  .mt-nav-in::-webkit-scrollbar{display:none}
+  .mt-nav-name{font:700 16px/1 'Bricolage Grotesque',system-ui,sans-serif;letter-spacing:-0.01em;white-space:nowrap;margin-right:6px}
+  .mt-nav a{color:#c9d6cc;text-decoration:none;font-size:15px;font-weight:600;white-space:nowrap;padding:13px 0 11px;border-bottom:3px solid transparent}
+  .mt-nav a:hover{color:#fff}
+  .mt-nav a[aria-current="page"]{color:#fff;border-bottom-color:#e0a526}
+  .mt-nav a:focus-visible{outline:3px solid #e0a526;outline-offset:2px;border-radius:2px}
+  @media(max-width:640px){.mt-nav-in{padding:0 14px;gap:6px 16px}.mt-nav-name{display:none}}
 </style>
 </head>
 <body>
+<nav class="mt-nav" aria-label="Marketing tools"><div class="mt-nav-in" style="max-width:none;padding:0 max(3vw,14px)"><span class="mt-nav-name">Marketing tools</span><a href="https://script.google.com/macros/s/AKfycbzMDf2G6V9Kl318wst7kKOur2nYn7tm6x2h8Iw1iKgsIEzN3c-5J0Ej6nvgndvyUmpr/exec" target="_top">Weekly Picker</a><a href="https://eloveland-bit.github.io/gbp-photo-map/" target="_top">Photo Map</a><a href="https://eloveland-bit.github.io/photo-blur/" target="_top" aria-current="page">Photo Blur</a></div></nav>
 <header class="bar">
   <h1>Photo Privacy Blur</h1>
   <p>Runs in your browser. Photos are not uploaded anywhere.</p>
